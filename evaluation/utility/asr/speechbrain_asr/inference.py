@@ -8,14 +8,14 @@ import tqdm
 import torch
 import torchaudio
 
-from utils import read_kaldi_format
+from utils import read_kaldi_format, load_audio
 
 
 class ASRDataset(torch.utils.data.Dataset):
     def __init__(self, wav_scp_file, asr_model):
         data = []
         for utt_id, wav_file in read_kaldi_format(wav_scp_file).items():
-            signal, sr = torchaudio.load(str(wav_file))
+            signal, sr = load_audio(wav_file)
             wav = asr_model.audio_normalizer(signal.squeeze(), sr)
             #wav = asr_model.load_audio(wav_file)
             wav_len = len(wav.squeeze())
@@ -88,6 +88,8 @@ class InferenceSpeechBrainASR:
         predicted = []
         targets = []
         for utt_id, ref in ref_texts.items():
+            if utt_id not in hyp_texts:
+                continue
             ids.append(utt_id)
             targets.append(ref)
             predicted.append(hyp_texts[utt_id])

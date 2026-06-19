@@ -7,7 +7,6 @@ import logging
 from speechbrain.processing.features import InputNormalization
 from speechbrain.lobes.features import Fbank
 import torch.nn.functional as F
-import soundfile as sf
 import pandas as pd
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 import os
@@ -17,6 +16,7 @@ from typing import List, Union, Tuple, Dict
 from collections import OrderedDict
 from hyperpyyaml import load_hyperpyyaml
 from speechbrain.pretrained import EncoderClassifier
+from utils import load_audio
 
 class WavLMFeatureExtractor:
     """
@@ -38,13 +38,9 @@ class WavLMFeatureExtractor:
    
     def _load_audio(self, file_path: str):
         """Loads and pre-processes a single audio file."""
-        audio_input, sr = sf.read(file_path)
-        audio_input = torch.from_numpy(audio_input).float()
-
+        audio_input, sr = load_audio(file_path)  # returns [channels, samples]
         # Ensure 1D audio (T,)
-        if audio_input.dim() > 1:
-            # Select first channel if stereo
-            audio_input = audio_input[0, :]
+        audio_input = audio_input[0]  # take first channel
         
         # Original code had layer norm here
         if self.cfg.normalize:

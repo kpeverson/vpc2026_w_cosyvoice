@@ -1,0 +1,1 @@
+from .cosyvoice2_pipeline import CosyVoice2Pipeline

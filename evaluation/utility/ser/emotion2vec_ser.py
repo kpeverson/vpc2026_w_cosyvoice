@@ -38,11 +38,18 @@ class Emotion2vecSERClassifier:
 
     def classify_file(self, wav_path):
         """
-        wav_path: path to 16kHz wav file.
+        wav_path: path to 16kHz wav file, or hdf5:/path/to/file.h5:key URI.
         Returns: (probs, score, index, [label]) compatible with SpeechBrain interface.
         """
+        wav_path_str = str(wav_path[-1] if isinstance(wav_path, list) else wav_path)
+        if wav_path_str.startswith('hdf5:'):
+            from utils import load_audio
+            signal, sr = load_audio(wav_path_str)
+            audio_input = signal.squeeze(0).numpy()  # FunASR expects 1D float32 numpy array
+        else:
+            audio_input = wav_path_str
         rec_result = self.model.generate(
-            str(wav_path),
+            audio_input,
             output_dir=None,
             granularity="utterance",
             extract_embedding=False,

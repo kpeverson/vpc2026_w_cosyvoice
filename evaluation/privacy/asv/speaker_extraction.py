@@ -4,7 +4,6 @@ import warnings
 from tqdm import tqdm
 from pathlib import Path
 import torch
-import torchaudio
 from tqdm.contrib.concurrent import process_map
 import time
 from torch.multiprocessing import set_start_method
@@ -13,7 +12,7 @@ from itertools import repeat
 from .speechbrain_vectors import SpeechBrainVectors
 from .utils import normalize_wave
 from .speaker_embeddings import SpeakerEmbeddings
-from utils import read_kaldi_format, remove_contents_in_dir, setup_logger
+from utils import read_kaldi_format, remove_contents_in_dir, setup_logger, load_audio
 
 set_start_method('spawn', force=True)
 logger = setup_logger(__name__)
@@ -34,11 +33,9 @@ def extraction_job(params):
     i = 0
     for utt, info in tqdm(utt_info.items(), desc=f'Job {job_id or 0}', leave=True):
         wav_path = info['path']
-        if isinstance(wav_path, list):
-            wav_path = wav_path[1]
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
-            signal, fs = torchaudio.load(wav_path)
+            signal, fs = load_audio(wav_path)
         # if len(signal.shape) == 2:
         #     signal = signal.squeeze(0)
         norm_wave = normalize_wave(signal, fs, device=device)
@@ -47,8 +44,8 @@ def extraction_job(params):
             with torch.no_grad():
                 spk_embs = [extractor.extract_vector(audio=norm_wave, sr=fs,wav_path=wav_path) for extractor in speaker_extractors]
         except RuntimeError as e:
-            logger.warning(f'Runtime error: {utt}, {signal.shape}, {norm_wave.shape}')
-            raise e
+            logger.warning(f'Skipping {utt} ({norm_wave.shape}, {signal.shape[1]/fs:.2f}s): {e}')
+            continue
             
         if len(spk_embs) == 1:
             vector = spk_embs[0]

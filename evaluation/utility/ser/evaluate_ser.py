@@ -6,7 +6,7 @@ import warnings
 
 from pathlib import Path
 from sklearn.metrics import recall_score, accuracy_score
-from utils import read_kaldi_format, scan_checkpoint, setup_logger
+from utils import read_kaldi_format, scan_checkpoint, setup_logger, load_audio
 
 logger = setup_logger(__name__)
 
@@ -20,7 +20,7 @@ class FoldSERDataset(torch.utils.data.Dataset):
         data = []
         utt2spk = read_kaldi_format(data_path / "utt2spk")
         for utt_id, wav_file in read_kaldi_format(data_path / "wav.scp").items():
-            wav, sr = torchaudio.load(str(wav_file))
+            wav, sr = load_audio(wav_file)
             wav_len = wav.shape
             spk = utt2spk[utt_id]
             data.append((utt_id, spk, wav, wav_len, sr))
@@ -37,7 +37,7 @@ class FoldSERDataset(torch.utils.data.Dataset):
 
 def _eval_ser_speechbrain(eval_datasets, eval_data_dir, models_path, anon_data_suffix, params, device):
     from speechbrain.inference.interfaces import foreign_class
-    results_dir = params['results_dir']
+    results_dir = Path(params['results_dir'])
     test_sets = eval_datasets + [f'{dataset}{anon_data_suffix}' for dataset in eval_datasets]
     results = []
     classifiers = {}
@@ -45,6 +45,7 @@ def _eval_ser_speechbrain(eval_datasets, eval_data_dir, models_path, anon_data_s
         data_path = eval_data_dir / test_set
         dataset = FoldSERDataset(data_path)
         utt2emo = read_kaldi_format(data_path / "utt2emo")
+        utt2hyp = {}
         for spkfold, fold in read_kaldi_format(data_path / "spk2fold").items():
             if fold not in classifiers:
                 model_dir = models_path / f"fold_{fold}"
@@ -75,6 +76,7 @@ def _eval_ser_speechbrain(eval_datasets, eval_data_dir, models_path, anon_data_s
                 lab2ind = classifiers[fold].hparams.label_encoder.lab2ind
                 hyp.append(lab2ind[text_lab[0]])
                 ref.append(lab2ind[utt2emo[uttid]])
+                utt2hyp[uttid] = text_lab[0]
                 if utt2emo[uttid] not in per_emo:
                     per_emo[utt2emo[uttid]] = {"hyp": [], "ref": []}
                 per_emo[utt2emo[uttid]]["hyp"].append([lab2ind[text_lab[0]]])
@@ -90,6 +92,12 @@ def _eval_ser_speechbrain(eval_datasets, eval_data_dir, models_path, anon_data_s
             results.append({'dataset': dataset_name, 'split': split_name, 'fold': fold,
                            'ser': 'anon' if anon_data_suffix in test_set else 'original', 'UAR': uar, **score_per_emo})
             print(f'{test_set} fold: {fold} - UAR: {uar}')
+        if utt2hyp:
+            results_dir.mkdir(parents=True, exist_ok=True)
+            hyp_path = results_dir / f'utt2hyp_emo_{test_set}'
+            with open(hyp_path, 'w') as f:
+                for uttid in sorted(utt2hyp):
+                    f.write(f'{uttid} {utt2hyp[uttid]}\n')
     return results
 
 
@@ -98,13 +106,14 @@ def _eval_ser_emotion2vec(eval_datasets, eval_data_dir, models_path, anon_data_s
     model_id = params.get('model_id', 'emotion2vec/emotion2vec_plus_large')
     hub = params.get('hub', 'hf')
     classifier = Emotion2vecSERClassifier(model_id=model_id, hub=hub, device=device)
+    results_dir = Path(params['results_dir'])
     test_sets = eval_datasets + [f'{dataset}{anon_data_suffix}' for dataset in eval_datasets]
     results = []
     for test_set in tqdm.tqdm(test_sets):
         data_path = eval_data_dir / test_set
         wav_scp = read_kaldi_format(data_path / "wav.scp")
         utt2emo = read_kaldi_format(data_path / "utt2emo")
-        hyp, ref, per_emo = [], [], {}
+        hyp, ref, per_emo, utt2hyp = [], [], {}, {}
         for uttid, wav_path in tqdm.tqdm(wav_scp.items()):
             ref_lab = utt2emo.get(uttid)
             if ref_lab not in LAB2IND:
@@ -116,6 +125,7 @@ def _eval_ser_emotion2vec(eval_datasets, eval_data_dir, models_path, anon_data_s
             pred = text_lab[0]
             hyp.append(LAB2IND[pred])
             ref.append(LAB2IND[ref_lab])
+            utt2hyp[uttid] = pred
             if ref_lab not in per_emo:
                 per_emo[ref_lab] = {"hyp": [], "ref": []}
             per_emo[ref_lab]["hyp"].append([LAB2IND[pred]])
@@ -131,6 +141,12 @@ def _eval_ser_emotion2vec(eval_datasets, eval_data_dir, models_path, anon_data_s
         results.append({'dataset': dataset_name, 'split': split_name, 'fold': 1,
                        'ser': 'anon' if anon_data_suffix in test_set else 'original', 'UAR': uar, **score_per_emo})
         print(f'{test_set} (emotion2vec+ SER) - UAR: {uar}')
+        if utt2hyp:
+            results_dir.mkdir(parents=True, exist_ok=True)
+            hyp_path = results_dir / f'utt2hyp_emo_{test_set}'
+            with open(hyp_path, 'w') as f:
+                for uttid in sorted(utt2hyp):
+                    f.write(f'{uttid} {utt2hyp[uttid]}\n')
     return results
 
 

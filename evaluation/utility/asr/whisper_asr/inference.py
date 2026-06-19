@@ -8,7 +8,7 @@ import torch
 import torchaudio
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-from utils import read_kaldi_format
+from utils import read_kaldi_format, load_audio
 
 
 class ASRDataset(torch.utils.data.Dataset):
@@ -113,14 +113,25 @@ class InferenceWhisperASR:
         chinese_chars = chinese_pattern.findall(text)
         return ''.join(chinese_chars) if chinese_chars else text
 
+    def _prepare_pipe_input(self, wav_file):
+        """Convert a wav.scp path to a pipeline-compatible input.
+        Regular paths are passed as strings; HDF5 URIs are pre-loaded as numpy arrays.
+        """
+        wav_file_str = str(wav_file[-1] if isinstance(wav_file, list) else wav_file)
+        if wav_file_str.startswith('hdf5:'):
+            signal, sr = load_audio(wav_file_str)
+            return {"array": signal.squeeze(0).numpy(), "sampling_rate": sr}
+        return wav_file_str
+
     def transcribe_audios(self, data, out_file):
         texts = {}
         for batch in tqdm.tqdm(data):
             utt_ids, wav_files = batch
             wav_files = list(wav_files)
-            #print(wav_files[0])
             language = None
-            wav_path_str = str(wav_files[0]).lower()
+            # Use the raw path string for language detection (works for both formats)
+            first_path = str(wav_files[0][-1] if isinstance(wav_files[0], list) else wav_files[0])
+            wav_path_str = first_path.lower()
             # Extract language from path segments
             # Handle two path formats:
             # 1. corpora/en/dev/... or corpora/cn/test/... (language as separate segment)
@@ -146,9 +157,8 @@ class InferenceWhisperASR:
                         break
             
             generate_kwargs = {"language": language} if language else {}
-            #print(f"Decoding language: {language}")
-            
-            predicts = self.pipe(wav_files, batch_size=len(wav_files), generate_kwargs=generate_kwargs)
+            pipe_inputs = [self._prepare_pipe_input(wf) for wf in wav_files]
+            predicts = self.pipe(pipe_inputs, batch_size=len(pipe_inputs), generate_kwargs=generate_kwargs)
             for i, utt_id in enumerate(utt_ids):
                 texts[deepcopy(utt_id)] = str(predicts[i]["text"])
 

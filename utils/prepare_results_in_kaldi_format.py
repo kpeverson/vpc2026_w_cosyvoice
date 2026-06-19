@@ -43,6 +43,30 @@ def list_wav_files_recursively(folder_path, extension=".wav"):
     return wav_files, key_to_wav_files
 
 
+def _is_valid_audio_path(audio) -> bool:
+    """Return True for regular file paths and for hdf5: URIs."""
+    if isinstance(audio, bytes):
+        audio = audio.decode('utf-8')
+    if audio.startswith('hdf5:'):
+        # hdf5:/path/to/file.h5:utt_id — check that the h5 file itself exists
+        rest = audio[len('hdf5:'):]
+        last_colon = rest.rfind(':')
+        h5_file = rest[:last_colon] if last_colon != -1 else rest
+        return os.path.isfile(h5_file)
+    return os.path.isfile(audio)
+
+
+def _wav_scp_uses_hdf5(path) -> bool:
+    """Return True if the first entry in a wav.scp uses an hdf5: URI."""
+    try:
+        with open(path, 'r') as f:
+            first = f.readline().strip()
+        parts = first.split(None, 1)
+        return len(parts) == 2 and parts[1].startswith('hdf5:')
+    except Exception:
+        return False
+
+
 def check_files(ori_folder, anon_folder, required_files):
     for required_file in required_files:
         if 'wav.scp' in str(required_file):
@@ -65,6 +89,10 @@ def check_files(ori_folder, anon_folder, required_files):
                 a = set([c.strip().split()[0] for c in content1])
                 b = set([c.strip().split()[0] for c in content2])
                 logger.warning(f"Missing keys: {a-b}")
+                # If the anon wav.scp already uses hdf5: URIs, trust it as-is
+                if _wav_scp_uses_hdf5(anon_folder / 'wav.scp'):
+                    logger.warning(f"wav.scp uses hdf5 URIs — keeping existing wav.scp with {len(content2)} entries.")
+                    return
                 create_wavscp_formart_data(ori_folder, anon_folder)
                 return
             ori_keys = [k.strip().split()[0] for k in content1]
@@ -77,7 +105,7 @@ def check_files(ori_folder, anon_folder, required_files):
                 ori_keys.remove(a_key)
 
                 audio = a.strip().split()[1]
-                if not os.path.isfile(audio):
+                if not _is_valid_audio_path(audio):
                     logger.warning(f"{anon_folder / 'wav.scp'}: {a_key} (file: {audio}) is not a valid path.")
                     create_wavscp_formart_data(ori_folder, anon_folder)
                     return

@@ -15,7 +15,7 @@ import random
 import torch
 import kaldiio
 
-from utils import read_kaldi_format, copy_data_dir, create_clean_dir, setup_logger, load_wav_from_scp
+from utils import read_kaldi_format, copy_data_dir, create_clean_dir, setup_logger, load_audio
 
 logger = setup_logger(__name__)
 
@@ -33,7 +33,7 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.all_wavs)
 
     def __getitem__(self, index):
-        audio, freq = load_wav_from_scp(self.all_wavs[index])
+        audio, freq = load_audio(self.all_wavs[index])
         f0 = self.get_f0_func(Wav(audio))
         return {"utid": self.all_keys[index],
                 "audio": audio,

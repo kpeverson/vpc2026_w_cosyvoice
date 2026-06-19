@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 
 import torch
+import torchaudio
 import soundfile as sf
 import io
 import os
@@ -86,6 +87,28 @@ def load_wav_from_scp(wav, frame_offset: int = 0,  num_frames: int = -1):
     sample = torch.from_numpy(sample).float()
 
     return sample, sr
+
+def load_audio(path):
+    """Load audio from a file path or an HDF5 URI (hdf5:/path/to/file.h5:key).
+
+    Returns (signal, sample_rate) matching torchaudio.load: signal is a
+    [channels, samples] float32 tensor.
+    """
+    path_str = str(path[-1] if isinstance(path, list) else path)
+    if path_str.startswith('hdf5:'):
+        rest = path_str[len('hdf5:'):]
+        last_colon = rest.rfind(':')
+        h5_path, key = rest[:last_colon], rest[last_colon + 1:]
+        import h5py
+        with h5py.File(h5_path, 'r') as f:
+            data = f[key][:]
+            sr = int(f[key].attrs.get('sample_rate', 16000))
+        signal = torch.from_numpy(data).float()
+        if signal.dim() == 1:
+            signal = signal.unsqueeze(0)
+        return signal, sr
+    return torchaudio.load(path_str)
+
 
 def read_table(filename, names, sep=' ', dtype=None):
     if isinstance(dtype, list):
