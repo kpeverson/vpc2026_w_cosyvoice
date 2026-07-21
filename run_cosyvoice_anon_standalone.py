@@ -9,11 +9,14 @@ Usage:
         --config configs/track1/anon_cosyvoice2.yaml [--gpu 0] [--force]
 """
 import argparse
+import json
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
+
+PROSODY_RATE = 12.5  # Hz — prosody embeddings are downsampled to this rate
 
 import h5py
 import numpy as np
@@ -243,6 +246,21 @@ def select_anon_embedding(src_emb, src_spk, src_gender, pool_raw, pool_norm, poo
         return build_anon_embedding(src_emb, filtered_raw, filtered_norm, n_anon, anon_percentile)
 
 
+def presplit_asr_text(text, max_words=40):
+    """Split punctuation-free ASR text into chunks before passing to CosyVoice2.
+
+    split_paragraph() inside text_normalize only splits on punctuation marks.
+    ASR transcripts have none, so the entire utterance becomes one segment and
+    the LLM must generate hundreds of speech tokens at once — well outside its
+    training distribution — causing truncation or garbled output. Pre-splitting
+    on word boundaries keeps each chunk in the model's reliable operating range.
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    return [' '.join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+
+
 def load_asr_transcripts(asr_text_dir: str) -> dict:
     """Load all Kaldi text files under asr_text_dir into a merged utt->transcript dict."""
     merged = {}
@@ -254,20 +272,108 @@ def load_asr_transcripts(asr_text_dir: str) -> dict:
     return merged
 
 
-def load_speaker_embeddings(dataset_path, wav_scp, utt2spk, tts):
-    """Load or extract per-speaker embeddings. Returns {spk: tensor [192]}."""
-    pt_path = dataset_path / 'spk2embedding.pt'
-    if pt_path.exists():
-        print(f'  Loading embeddings from {pt_path}')
-        raw = torch.load(pt_path, map_location='cpu')
-        return {spk: torch.tensor(v, dtype=torch.float32) for spk, v in raw.items()}
+def load_alignments(dataset_path):
+    """Load word-level alignments produced by align.py for a dataset.
 
-    print(f'  No spk2embedding.pt — extracting on-the-fly (slow)')
-    spk2embs = {}
+    Returns {utt_id: [word_entry, ...]} where each entry is a dict with
+    'unit', 'characters', 'start', 'end'. Delimiter entries ('word_N_delim')
+    are included; callers should filter them when building time lookups.
+    Returns an empty dict if no alignment file exists for this dataset.
+    """
+    align_file = Path(dataset_path) / 'align_input_rank0_alignments.json'
+    if not align_file.exists():
+        return {}
+    with open(align_file) as f:
+        raw = json.load(f)
+    return {utt: v.get('words', []) for utt, v in raw.items()}
+
+
+def split_text_and_prosody(text, utt, prosody_emb, utt_word_entries, max_words=40):
+    """Split text and prosody at aligned word boundaries.
+
+    For utterances within max_words, returns the full text and prosody unchanged.
+    For longer utterances, splits both text and prosody at the same word boundary
+    so each chunk receives the prosody frames that correspond to its words.
+    Falls back to None prosody for any chunk whose alignment boundary is missing.
+
+    Args:
+        text: lowercase text string (space-separated words)
+        utt: utterance ID (used only for debug context)
+        prosody_emb: tensor [1, T, D] at PROSODY_RATE Hz, or None
+        utt_word_entries: list of word alignment dicts for this utterance, or []
+        max_words: maximum words per chunk
+
+    Returns:
+        (text_chunks, prosody_chunks) — parallel lists of equal length
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return [text], [prosody_emb]
+
+    chunk_starts = list(range(0, len(words), max_words))
+    text_chunks = [' '.join(words[s:s + max_words]) for s in chunk_starts]
+
+    if prosody_emb is None or not utt_word_entries:
+        return text_chunks, [None] * len(text_chunks)
+
+    # Build 1-indexed word number → end time, skipping delimiter entries
+    word_end_times = {}
+    for entry in utt_word_entries:
+        if '_delim' not in entry['unit']:
+            word_num = int(entry['unit'].split('_')[1])
+            word_end_times[word_num] = entry['end']
+
+    prosody_chunks = []
+    prev_frame = 0
+    for i, start in enumerate(chunk_starts):
+        if i == len(chunk_starts) - 1:
+            prosody_chunks.append(prosody_emb[:, prev_frame:, :])
+        else:
+            # words[start : start+max_words] are word numbers start+1 .. start+max_words
+            # in 1-indexed alignment; the last of these is start+max_words
+            split_word_num = start + max_words
+            if split_word_num in word_end_times:
+                split_frame = min(
+                    int(round(word_end_times[split_word_num] * PROSODY_RATE)),
+                    prosody_emb.shape[1],
+                )
+                prosody_chunks.append(prosody_emb[:, prev_frame:split_frame, :])
+                prev_frame = split_frame
+            else:
+                # No alignment for this boundary — give up on prosody for all remaining chunks
+                prosody_chunks.append(None)
+                prosody_chunks.extend([None] * (len(chunk_starts) - len(prosody_chunks)))
+                break
+
+    return text_chunks, prosody_chunks
+
+
+def load_utterance_embeddings(dataset_path, wav_scp, utt2spk, tts):
+    """Load or extract per-utterance source embeddings. Returns {utt: tensor [192]}.
+
+    Fallback chain:
+      1. utt2embedding.pt  — pre-extracted per-utterance embeddings (preferred)
+      2. spk2embedding.pt  — per-speaker averages; warns that all utterances from the
+                             same speaker share the same source embedding
+      3. on-the-fly extraction per utterance (slow)
+    """
+    utt_pt = dataset_path / 'utt2embedding.pt'
+    if utt_pt.exists():
+        print(f'  Loading per-utterance embeddings from {utt_pt}')
+        raw = torch.load(utt_pt, map_location='cpu')
+        return {utt: torch.tensor(v, dtype=torch.float32) for utt, v in raw.items()}
+
+    spk_pt = dataset_path / 'spk2embedding.pt'
+    if spk_pt.exists():
+        print(f'  No utt2embedding.pt — falling back to per-speaker embeddings from {spk_pt}')
+        print(f'  Warning: all utterances from the same speaker will share the same source embedding')
+        raw = torch.load(spk_pt, map_location='cpu')
+        spk2emb = {spk: torch.tensor(v, dtype=torch.float32) for spk, v in raw.items()}
+        return {utt: spk2emb[spk] for utt, spk in utt2spk.items() if spk in spk2emb}
+
+    print(f'  No utt2embedding.pt or spk2embedding.pt — extracting per-utterance on-the-fly (slow)')
+    utt2emb = {}
     for utt, wav_path in tqdm(wav_scp.items(), desc='  Extracting embeddings'):
-        spk = utt2spk.get(utt)
-        if spk is None:
-            continue
         try:
             path, is_tmp = write_temp_wav(wav_path)
             try:
@@ -275,10 +381,10 @@ def load_speaker_embeddings(dataset_path, wav_scp, utt2spk, tts):
             finally:
                 if is_tmp:
                     os.unlink(path)
-            spk2embs.setdefault(spk, []).append(emb)
+            utt2emb[utt] = emb
         except Exception as e:
             print(f'  [warn] embedding failed for {utt}: {e}')
-    return {spk: torch.stack(embs).mean(0) for spk, embs in spk2embs.items()}
+    return utt2emb
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +393,8 @@ def load_speaker_embeddings(dataset_path, wav_scp, utt2spk, tts):
 
 def _synthesis_worker(args):
     (utt_subset, cosyvoice_root, model_dir, prosody_encoder_path,
-     gpu_index, spk2anon_emb_cpu, utt2text, utt2spk, wav_scp,
-     temp_h5_path, output_sr) = args
+     gpu_index, utt2anon_emb_cpu, utt2text, utt2spk, wav_scp,
+     utt2alignment, temp_h5_path, output_sr) = args
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_index)
 
@@ -302,13 +408,12 @@ def _synthesis_worker(args):
     device = tts.model.device
     use_prosody = bool(prosody_encoder_path)
 
-    spk2anon_emb = {spk: emb.to(device) for spk, emb in spk2anon_emb_cpu.items()}
+    utt2anon_emb = {utt: emb.to(device) for utt, emb in utt2anon_emb_cpu.items()}
 
     with h5py.File(temp_h5_path, 'w') as hf:
         for utt in tqdm(utt_subset, desc=f'GPU {gpu_index}', position=gpu_index):
-            spk  = utt2spk.get(utt)
             text = utt2text.get(utt, '').lower()
-            if not text or spk not in spk2anon_emb:
+            if not text or utt not in utt2anon_emb:
                 continue
             try:
                 prosody_emb = None
@@ -320,18 +425,22 @@ def _synthesis_worker(args):
                         if is_tmp:
                             os.unlink(path)
 
+                text_chunks, prosody_chunks = split_text_and_prosody(
+                    text, utt, prosody_emb, utt2alignment.get(utt, [])
+                )
                 chunks = []
-                for seg in tts.frontend.text_normalize(text, split=True):
-                    tok, tok_len = tts.frontend._extract_text_token(seg)
-                    model_input = {
-                        'text': tok, 'text_len': tok_len,
-                        'llm_embedding': spk2anon_emb[spk],
-                        'flow_embedding': spk2anon_emb[spk],
-                    }
-                    if prosody_emb is not None:
-                        model_input['prosody_emb'] = prosody_emb
-                    for out in tts.model.tts(**model_input, stream=False, speed=1.0):
-                        chunks.append(out['tts_speech'].cpu())
+                for seg_text, seg_prosody in zip(text_chunks, prosody_chunks):
+                    for seg in tts.frontend.text_normalize(seg_text, split=True):
+                        tok, tok_len = tts.frontend._extract_text_token(seg)
+                        model_input = {
+                            'text': tok, 'text_len': tok_len,
+                            'llm_embedding': utt2anon_emb[utt],
+                            'flow_embedding': utt2anon_emb[utt],
+                        }
+                        if seg_prosody is not None:
+                            model_input['prosody_emb'] = seg_prosody
+                        for out in tts.model.tts(**model_input, stream=False, speed=1.0):
+                            chunks.append(out['tts_speech'].cpu())
 
                 if not chunks:
                     continue
@@ -391,7 +500,7 @@ def synthesise_dataset(dataset_name, src_path, output_path, tts, pool_raw, pool_
               f'(ground truth for remaining {len(utt2text) - n_replaced})')
         utt2text = {u: asr_transcripts.get(u, gt) for u, gt in utt2text.items()}
 
-    spk2src_emb = load_speaker_embeddings(src_path, wav_scp, utt2spk, tts)
+    utt2src_emb = load_utterance_embeddings(src_path, wav_scp, utt2spk, tts)
 
     src_spk2gender = load_gender_file(src_path / 'spk2gender') if gender_mode != 'all' else {}
     if gender_mode != 'all' and not src_spk2gender:
@@ -401,13 +510,18 @@ def synthesise_dataset(dataset_name, src_path, output_path, tts, pool_raw, pool_
 
     rng = np.random.default_rng(seed)
 
-    # Keep anon embeddings on CPU — workers move them to their own device
-    spk2anon_emb_cpu = {
-        spk: select_anon_embedding(
-            emb, spk, src_spk2gender.get(spk), pool_raw, pool_norm, pool_ids,
-            pool_genders, n_anon, anon_percentile, anon_method, gender_mode, rng,
+    # Build a per-utterance anon embedding — every utterance gets an independent draw.
+    # The source embedding is per-utterance, so farthest/percentile methods use each
+    # utterance's own embedding as the reference point.
+    # Keep on CPU — workers move them to their own device.
+    utt2anon_emb_cpu = {
+        utt: select_anon_embedding(
+            utt2src_emb[utt], utt2spk[utt], src_spk2gender.get(utt2spk[utt]),
+            pool_raw, pool_norm, pool_ids, pool_genders, n_anon, anon_percentile,
+            anon_method, gender_mode, rng,
         )
-        for spk, emb in spk2src_emb.items()
+        for utt in utt2spk
+        if utt in utt2src_emb
     }
 
     # Load already-done keys for resumability
@@ -419,19 +533,25 @@ def synthesise_dataset(dataset_name, src_path, output_path, tts, pool_raw, pool_
     pending = [
         utt for utt in wav_scp
         if utt not in already_done
-        and utt2spk.get(utt) in spk2anon_emb_cpu
+        and utt in utt2anon_emb_cpu
         and utt2text.get(utt, '').strip()
     ]
+
+    utt2alignment = load_alignments(src_path)
+    if utt2alignment:
+        print(f'  Loaded word alignments for {len(utt2alignment)} utterances')
+    else:
+        print(f'  No alignment file found — long utterances will not use prosody')
 
     if not pending:
         print(f'  All {len(already_done)} utterances already done.')
     elif len(gpu_ids) == 1:
-        _run_single_gpu(pending, h5_path, tts, spk2anon_emb_cpu, utt2text, utt2spk,
-                        wav_scp, prosody_encoder_path, output_sr, dataset_name)
+        _run_single_gpu(pending, h5_path, tts, utt2anon_emb_cpu, utt2text, utt2spk,
+                        wav_scp, prosody_encoder_path, utt2alignment, output_sr, dataset_name)
     else:
-        _run_multi_gpu(pending, output_path, h5_path, spk2anon_emb_cpu, utt2text, utt2spk,
+        _run_multi_gpu(pending, output_path, h5_path, utt2anon_emb_cpu, utt2text, utt2spk,
                        wav_scp, cosyvoice_root, model_dir, prosody_encoder_path,
-                       output_sr, gpu_ids)
+                       utt2alignment, output_sr, gpu_ids)
 
     # Write wav.scp
     with h5py.File(h5_path, 'r') as hf:
@@ -441,19 +561,18 @@ def synthesise_dataset(dataset_name, src_path, output_path, tts, pool_raw, pool_
     print(f'  Wrote {len(lines)} entries to wav.scp')
 
 
-def _run_single_gpu(pending, h5_path, tts, spk2anon_emb_cpu, utt2text, utt2spk,
-                    wav_scp, prosody_encoder_path, output_sr, desc):
+def _run_single_gpu(pending, h5_path, tts, utt2anon_emb_cpu, utt2text, utt2spk,
+                    wav_scp, prosody_encoder_path, utt2alignment, output_sr, desc):
     print(f'  Synthesising {len(pending)} utterances on 1 GPU...')
     device = tts.model.device
     use_prosody = bool(prosody_encoder_path)
-    spk2anon_emb = {spk: emb.to(device) for spk, emb in spk2anon_emb_cpu.items()}
+    utt2anon_emb = {utt: emb.to(device) for utt, emb in utt2anon_emb_cpu.items()}
 
     with h5py.File(h5_path, 'a') as hf:
         hf.attrs['cosyvoice2_synthesized'] = True
         for utt in tqdm(pending, desc=f'  {desc}'):
-            spk  = utt2spk[utt]
             text = utt2text[utt].lower()
-            emb  = spk2anon_emb[spk]
+            emb  = utt2anon_emb[utt]
             try:
                 prosody_emb = None
                 if use_prosody and utt in wav_scp:
@@ -464,17 +583,21 @@ def _run_single_gpu(pending, h5_path, tts, spk2anon_emb_cpu, utt2text, utt2spk,
                         if is_tmp:
                             os.unlink(path)
 
+                text_chunks, prosody_chunks = split_text_and_prosody(
+                    text, utt, prosody_emb, utt2alignment.get(utt, [])
+                )
                 chunks = []
-                for seg in tts.frontend.text_normalize(text, split=True):
-                    tok, tok_len = tts.frontend._extract_text_token(seg)
-                    model_input = {
-                        'text': tok, 'text_len': tok_len,
-                        'llm_embedding': emb, 'flow_embedding': emb,
-                    }
-                    if prosody_emb is not None:
-                        model_input['prosody_emb'] = prosody_emb
-                    for out in tts.model.tts(**model_input, stream=False, speed=1.0):
-                        chunks.append(out['tts_speech'].cpu())
+                for seg_text, seg_prosody in zip(text_chunks, prosody_chunks):
+                    for seg in tts.frontend.text_normalize(seg_text, split=True):
+                        tok, tok_len = tts.frontend._extract_text_token(seg)
+                        model_input = {
+                            'text': tok, 'text_len': tok_len,
+                            'llm_embedding': emb, 'flow_embedding': emb,
+                        }
+                        if seg_prosody is not None:
+                            model_input['prosody_emb'] = seg_prosody
+                        for out in tts.model.tts(**model_input, stream=False, speed=1.0):
+                            chunks.append(out['tts_speech'].cpu())
 
                 if not chunks:
                     print(f'  [warn] no output for {utt}')
@@ -494,9 +617,9 @@ def _run_single_gpu(pending, h5_path, tts, spk2anon_emb_cpu, utt2text, utt2spk,
                 print(f'  [warn] synthesis failed for {utt}: {e}')
 
 
-def _run_multi_gpu(pending, output_path, h5_path, spk2anon_emb_cpu, utt2text, utt2spk,
+def _run_multi_gpu(pending, output_path, h5_path, utt2anon_emb_cpu, utt2text, utt2spk,
                    wav_scp, cosyvoice_root, model_dir, prosody_encoder_path,
-                   output_sr, gpu_ids):
+                   utt2alignment, output_sr, gpu_ids):
     from torch.multiprocessing import Pool, set_start_method
     try:
         set_start_method('spawn', force=True)
@@ -510,8 +633,8 @@ def _run_multi_gpu(pending, output_path, h5_path, spk2anon_emb_cpu, utt2text, ut
 
     worker_args = [
         (subsets[i], cosyvoice_root, model_dir, prosody_encoder_path,
-         gpu_ids[i], spk2anon_emb_cpu, utt2text, utt2spk, wav_scp,
-         temp_h5s[i], output_sr)
+         gpu_ids[i], utt2anon_emb_cpu, utt2text, utt2spk, wav_scp,
+         utt2alignment, temp_h5s[i], output_sr)
         for i in range(n)
     ]
 
@@ -584,7 +707,7 @@ def main():
     anon_percentile      = float(m['anon_percentile']) if m.get('anon_percentile') is not None else None
     anon_method          = str(m.get('anon_method', 'farthest'))
     seed                 = int(m.get('seed', 0))
-    gender_mode          = str(m.get('gender', 'all'))
+    gender_mode          = str(m.get('gender_mode', 'all'))
     if gender_mode not in ('all', 'same', 'opposite'):
         raise ValueError(f"config gender must be 'all', 'same', or 'opposite', got {gender_mode!r}")
 
