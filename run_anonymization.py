@@ -13,8 +13,11 @@ def _str_to_bool(v):
 parser.add_argument('--config', default='anon_config.yaml')
 parser.add_argument('--gpu_ids', default='0')
 parser.add_argument('--force_compute', default='false', type=str)
+parser.add_argument('--pack_output', default='false', type=str,
+                    help='Pack anonymized wav/ directories into HDF5 after anonymization.')
 args = parser.parse_args()
 args.force_compute = _str_to_bool(args.force_compute)
+args.pack_output = _str_to_bool(args.pack_output)
 
 if 'CUDA_VISIBLE_DEVICES' not in os.environ:  # do not overwrite previously set devices
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -67,6 +70,9 @@ if __name__ == '__main__':
         venv_name = 'venv_sttts' if config['pipeline'] == 'sttts' else 'venv_sttts_multi'
         venv_python = Path(__file__).parent / venv_name / 'bin' / 'python'
         if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+            venv_lib = str(Path(__file__).parent / venv_name / 'lib')
+            existing = os.environ.get('LD_LIBRARY_PATH', '')
+            os.environ['LD_LIBRARY_PATH'] = f'{venv_lib}:{existing}' if existing else venv_lib
             os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
     datasets = get_datasets(config)
@@ -117,11 +123,18 @@ if __name__ == '__main__':
         shell_run('anonymization/pipelines/ssl/install.sh')
         check_dependencies('anonymization/pipelines/ssl/requirements.txt')
         from anonymization.pipelines.ssl.ssl_pipeline import SSLPipeline as pipeline
-    elif config['pipeline'] == "template":
-        from anonymization.pipelines.template import TemplatePipeline as pipeline
+    elif config['pipeline'] == "cosyvoice2":
+        from anonymization.pipelines.cosyvoice2 import CosyVoice2Pipeline as pipeline
     else:
         raise ValueError(f"Pipeline {config['pipeline']} not defined/imported")
 
     logger.info(f'Running pipeline: {config["pipeline"]}')
     p = pipeline(config=config, force_compute=args.force_compute, devices=devices)
     p.run_anonymization_pipeline(datasets)
+
+    if args.pack_output:
+        from pack_wav_to_hdf5 import pack_directory
+        anon_suffix = config.get('anon_suffix', '')
+        for dataset_name, dataset_path in datasets.items():
+            output_path = Path(str(dataset_path) + anon_suffix)
+            pack_directory(output_path)
